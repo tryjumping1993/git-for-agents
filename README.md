@@ -16,10 +16,13 @@ markers. Per file-pattern rule, it picks a strategy:
 | `regenerate`         | Refuse to hand-merge; tells you the command to regenerate the file       | lockfiles |
 | `manual-conflict`    | Always flags a conflict for human review                                 | binary assets |
 
-`json-deep-merge`/`yaml-deep-merge` only auto-resolve at the key level: if
-both branches change the *same* key/array to different values, or one side
-deletes a key the other modified, it's still reported as a conflict (the
-file is left with `ours` for that key so you can review and fix it).
+`json-deep-merge`/`yaml-deep-merge` auto-resolve at the key level: if both
+branches only *add* different keys, they combine cleanly. If both branches
+only *append* new items to the same list, the new items from both sides are
+unioned (deduplicated, order preserved). Anything more entangled — the same
+key/list changed to conflicting values, reordering, or one side deleting a
+key the other modified — is reported as a conflict (the file is left with
+`ours` for that spot so you can review and fix it).
 
 ### Setup (once per clone, and after editing merge-policy.yaml)
 
@@ -31,6 +34,21 @@ python scripts/setup_merge_drivers.py
 This updates `.gitattributes` (commit it) and configures the merge drivers
 in your local `.git/config`. Every clone/agent needs to run the setup
 script once — `.gitattributes` alone can't carry the driver commands.
+
+### Step 0: analyze before merging multiple branches
+
+Before combining several diverged branches into a moving target (e.g. a
+`main` that has kept landing its own features/fixes), get a preflight
+report of which files overlap and a suggested merge order:
+
+```sh
+python scripts/analyze_merge_plan.py main feature/a feature/b feature/c
+```
+
+This flags files touched by more than one branch, files that the target
+(`main`) *itself* already changed since each branch diverged (the highest-risk
+case — it's easy to only compare branches against each other and miss this),
+and orders branches so low-risk ones merge first.
 
 ### Important: use sequential merges, not octopus
 
