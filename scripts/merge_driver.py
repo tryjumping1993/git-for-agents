@@ -1,177 +1,160 @@
-"""Generic git merge driver dispatched via .gitattributes `merge=<strategy>`.
+"""Git file merge driver: write %A only on a clean structured merge.
 
-Registered by scripts/setup_merge_drivers.py as:
-
-    merge.<strategy>.driver = python scripts/merge_driver.py --strategy <strategy> %O %A %B %P
-
-Git calls this once per conflicted file during any merge (2-way, octopus,
-rebase, cherry-pick, ...). Contract:
-  - %O = temp path to the common-ancestor ("base") version
-  - %A = temp path to "our" version; MUST be overwritten with the final
-         merged content; this is also what git uses if we report success
-  - %B = temp path to "their" version
-  - %P = the real path of the file in the repo (for reporting only)
-
-Exit code 0  -> merge is clean, %A holds the final content
-Exit code !=0 -> git records the file as conflicted (stage 1/2/3 preserved),
-                 %A's content is still shown to the user as the working-tree
-                 version, so we still write our best-effort/annotated result.
+Custom drivers run when Git needs a file-level merge; they are not review
+gates for one-sided changes or other merges Git can resolve without a driver.
 """
 from __future__ import annotations
 
 import argparse
-import fnmatch
+import json
+import math
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 import yaml
 
-from merge_policy import load_policy
+from merge_policy import CUSTOM_STRATEGIES, UniqueKeyLoader, load_policy, resolve_path, repository_ignore_case
 
 MISSING = object()
 
 
-def find_rule(policy: dict, real_path: str) -> dict | None:
-    name = pathlib.PurePosixPath(real_path).name
-    for rule in policy["rules"]:
-        if fnmatch.fnmatch(real_path, rule["pattern"]) or fnmatch.fnmatch(name, rule["pattern"]):
-            return rule
-    return None
+def same(left, right):
+    """Python considers True == 1; structured data must preserve scalar types."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(same(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def merge_value(base, ours, theirs, path, conflicts):
-    if ours == theirs:
+    if same(ours, theirs):
         return ours
-    if base == ours:
+    if same(base, ours):
         return theirs
-    if base == theirs:
+    if same(base, theirs):
         return ours
-
-    ours_is_map = isinstance(ours, dict) or ours is MISSING
-    theirs_is_map = isinstance(theirs, dict) or theirs is MISSING
-    base_is_map = isinstance(base, dict) or base is MISSING
-    if ours_is_map and theirs_is_map and base_is_map and not (ours is MISSING and theirs is MISSING):
-        base_d = base if isinstance(base, dict) else {}
-        ours_d = ours if isinstance(ours, dict) else {}
-        theirs_d = theirs if isinstance(theirs, dict) else {}
-        keys = dict.fromkeys(list(base_d) + list(ours_d) + list(theirs_d))
+    # Deleting a mapping while the other branch modifies it is a conflict at
+    # the mapping itself, including changes that add keys to an empty map.
+    if ours is MISSING or theirs is MISSING:
+        conflicts.append(path)
+        return ours
+    if isinstance(ours, dict) and isinstance(theirs, dict) and (isinstance(base, dict) or base is MISSING):
+        base_d = {} if base is MISSING else base
         result = {}
-        for key in keys:
-            sub = merge_value(
-                base_d.get(key, MISSING),
-                ours_d.get(key, MISSING),
-                theirs_d.get(key, MISSING),
-                f"{path}.{key}",
-                conflicts,
-            )
-            if sub is not MISSING:
-                result[key] = sub
+        for key in dict.fromkeys(list(base_d) + list(ours) + list(theirs)):
+            value = merge_value(base_d.get(key, MISSING), ours.get(key, MISSING),
+                                theirs.get(key, MISSING), f"{path}[{json.dumps(key)}]", conflicts)
+            if value is not MISSING:
+                result[key] = value
         return result
-
-    # Scalar/list/type mismatch that genuinely differs on both sides.
+    # Lists are atomic: append order can change program or deployment behavior.
     conflicts.append(path)
     return ours
 
 
-def three_way_merge_structured(base_text: str, ours_text: str, theirs_text: str, loader, dumper):
-    base = loader(base_text) or {}
-    ours = loader(ours_text) or {}
-    theirs = loader(theirs_text) or {}
-    conflicts: list[str] = []
+def validate_tree(value, ancestors=None):
+    ancestors = set() if ancestors is None else ancestors
+    if isinstance(value, (dict, list)):
+        if id(value) in ancestors:
+            raise ValueError("Cyclic YAML aliases are not supported")
+        ancestors.add(id(value))
+        if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
+            raise ValueError("Mapping keys must be strings")
+        for child in value.values() if isinstance(value, dict) else value:
+            validate_tree(child, ancestors)
+        ancestors.remove(id(value))
+    elif type(value) not in (str, int, float, bool, type(None)):
+        raise ValueError("Only JSON-compatible YAML data is supported (no dates, sets, or custom tags)")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("Non-finite numbers are not supported")
+
+
+def three_way_merge_structured(base_text, ours_text, theirs_text, loader, dumper):
+    base = MISSING if base_text == "" else loader(base_text)
+    ours, theirs = loader(ours_text), loader(theirs_text)
+    for value in (base, ours, theirs):
+        if value is not MISSING:
+            validate_tree(value)
+    conflicts = []
     merged = merge_value(base, ours, theirs, "$", conflicts)
-    if merged is MISSING:
-        merged = {}
-    return dumper(merged), conflicts
+    # Preserve ours byte-for-byte at the CLI on conflict, not a partial merge.
+    return (ours_text if conflicts else dumper(merged)), conflicts
+
+
+def unique_json(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 
 
 def strategy_json(base_text, ours_text, theirs_text):
-    import json
-
-    return three_way_merge_structured(
-        base_text,
-        ours_text,
-        theirs_text,
-        loader=json.loads,
-        dumper=lambda d: json.dumps(d, indent=2, sort_keys=False) + "\n",
-    )
+    return three_way_merge_structured(base_text, ours_text, theirs_text,
+        loader=lambda text: json.loads(text, object_pairs_hook=unique_json),
+        dumper=lambda value: json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def strategy_yaml(base_text, ours_text, theirs_text):
-    return three_way_merge_structured(
-        base_text,
-        ours_text,
-        theirs_text,
-        loader=yaml.safe_load,
-        dumper=lambda d: yaml.safe_dump(d, sort_keys=False),
-    )
+    return three_way_merge_structured(base_text, ours_text, theirs_text,
+        loader=lambda text: yaml.load(text, Loader=UniqueKeyLoader),
+        dumper=lambda value: yaml.safe_dump(value, sort_keys=False, allow_unicode=True))
 
 
-def strategy_regenerate(real_path, ours_path, rule):
-    command = rule.get("command", "<regenerate command not configured>")
-    print(
-        f"[merge-policy] '{real_path}' is a generated lockfile (strategy=regenerate).\n"
-        f"  Keeping your working copy as-is. After resolving any code conflicts, run:\n"
-        f"    {command}\n"
-        f"  then `git add {real_path}` to finish.",
-        file=sys.stderr,
-    )
-    return 1  # always leave as a conflict so it can't be silently committed stale
+def write_result(path, text):
+    """Complete the write before replacing ours, including on I/O failure."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         dir=path.parent, prefix=".merge-policy-", delete=False) as stream:
+            temporary = pathlib.Path(stream.name)
+            stream.write(text)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
-def strategy_manual_conflict(real_path):
-    print(
-        f"[merge-policy] '{real_path}' cannot be auto-merged (strategy=manual-conflict).\n"
-        f"  Resolve by hand, e.g.:\n"
-        f"    git checkout --ours -- {real_path}   # or --theirs\n"
-        f"    git add {real_path}",
-        file=sys.stderr,
-    )
-    return 1
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--strategy", required=True)
-    parser.add_argument("base_path")
-    parser.add_argument("ours_path")
-    parser.add_argument("theirs_path")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--strategy", required=True, choices=sorted(CUSTOM_STRATEGIES))
+    parser.add_argument("--policy", type=pathlib.Path, default=pathlib.Path("merge-policy.yaml"))
+    parser.add_argument("base_path", type=pathlib.Path)
+    parser.add_argument("ours_path", type=pathlib.Path)
+    parser.add_argument("theirs_path", type=pathlib.Path)
     parser.add_argument("real_path")
     args = parser.parse_args()
-
-    if args.strategy == "manual-conflict":
-        return strategy_manual_conflict(args.real_path)
-
-    if args.strategy == "regenerate":
-        policy = load_policy()
-        rule = find_rule(policy, args.real_path) or {}
-        return strategy_regenerate(args.real_path, args.ours_path, rule)
-
-    ours_file = pathlib.Path(args.ours_path)
-    base_text = pathlib.Path(args.base_path).read_text(encoding="utf-8")
-    ours_text = ours_file.read_text(encoding="utf-8")
-    theirs_text = pathlib.Path(args.theirs_path).read_text(encoding="utf-8")
-
-    if args.strategy == "json-deep-merge":
-        merged_text, conflicts = strategy_json(base_text, ours_text, theirs_text)
-    elif args.strategy == "yaml-deep-merge":
-        merged_text, conflicts = strategy_yaml(base_text, ours_text, theirs_text)
-    else:
-        print(f"[merge-policy] unknown strategy '{args.strategy}', falling back to `git merge-file`", file=sys.stderr)
-        return subprocess.run(["git", "merge-file", args.ours_path, args.base_path, args.theirs_path]).returncode
-
-    ours_file.write_text(merged_text, encoding="utf-8")
-
-    if conflicts:
-        print(
-            f"[merge-policy] '{args.real_path}' merged with {len(conflicts)} key-level conflict(s) "
-            f"kept as 'ours' at: {', '.join(conflicts)}. Review and edit, then `git add`.",
-            file=sys.stderr,
-        )
+    try:
+        if args.strategy == "manual-conflict":
+            print(f"[merge-policy] {args.real_path!r}: resolve manually; ours is unchanged.", file=sys.stderr)
+            return 1
+        if args.strategy == "regenerate":
+            rule = resolve_path(load_policy(args.policy), args.real_path,
+                                ignore_case=repository_ignore_case(pathlib.Path.cwd()))
+            command = rule.get("command", "Use the repository's documented generator and pinned tool version.")
+            print(f"[merge-policy] {args.real_path!r}: generated artifact requires regeneration.\n"
+                  f"  {command}\n  Run from the owning package/project directory after resolving inputs; "
+                  "review the result, then stage it. No command was executed.", file=sys.stderr)
+            return 1
+        texts = [p.read_text(encoding="utf-8") for p in (args.base_path, args.ours_path, args.theirs_path)]
+        strategy = strategy_json if args.strategy == "json-deep-merge" else strategy_yaml
+        merged, conflicts = strategy(*texts)
+        if conflicts:
+            print(f"[merge-policy] {args.real_path!r}: conflicts at {', '.join(conflicts)}; "
+                  "ours is unchanged. Review Git's base/ours/theirs stages and resolve.", file=sys.stderr)
+            return 1
+        write_result(args.ours_path, merged)
+        return 0
+    except (OSError, UnicodeError, ValueError, yaml.YAMLError, RecursionError, subprocess.CalledProcessError) as exc:
+        print(f"[merge-policy] {args.real_path!r}: cannot merge ({exc}); ours is unchanged.", file=sys.stderr)
         return 1
-
-    print(f"[merge-policy] '{args.real_path}' auto-merged cleanly (strategy={args.strategy}).")
-    return 0
 
 
 if __name__ == "__main__":

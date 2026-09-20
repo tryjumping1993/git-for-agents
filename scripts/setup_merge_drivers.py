@@ -1,82 +1,84 @@
-"""Apply merge-policy.yaml to this repo's local git config and .gitattributes.
-
-Run once after cloning, and again whenever merge-policy.yaml changes:
-
-    python scripts/setup_merge_drivers.py
-
-This only touches:
-  - .gitattributes            (committed, shared with everyone)
-  - .git/config (local)       (per-clone `git config merge.<name>.*` entries)
-
-Every teammate/agent must run this once; .gitattributes alone can reference
-custom drivers, but the *driver command itself* is intentionally local repo
-config (per git's design) so it must be (re)applied per clone.
-"""
+"""Install merge drivers for any Git working tree. Re-run after policy edits."""
 from __future__ import annotations
 
-import subprocess
+import argparse
+import pathlib
+import shlex
 import sys
 
-from merge_policy import REPO_ROOT, BUILTIN_STRATEGIES, CUSTOM_STRATEGIES, load_policy
+from merge_policy import (CUSTOM_STRATEGIES, TOOL_ROOT, PolicyError, add_repository_arguments,
+                          git, repository_context, rule_patterns, run_cli)
 
 GITATTRIBUTES_MARKER_START = "# >>> merge-policy.yaml (auto-generated, do not edit by hand) >>>"
 GITATTRIBUTES_MARKER_END = "# <<< merge-policy.yaml <<<"
 
 
+def strategy_attribute(strategy):
+    # Unspecified retains Git's binary detection and any merge.default config.
+    return "!merge" if strategy == "standard" else f"merge={strategy}"
+
+
 def build_gitattributes_block(policy: dict) -> str:
-    lines = [GITATTRIBUTES_MARKER_START]
+    lines = [GITATTRIBUTES_MARKER_START,
+             f"* {strategy_attribute(policy['default_strategy'])} git-for-agents-category={policy['default_category']}"]
     for rule in policy["rules"]:
-        strategy = rule["strategy"]
-        if strategy == "standard":
-            continue  # git's default behavior, no attribute needed
-        lines.append(f"{rule['pattern']} merge={strategy}")
-        for excl in rule.get("exclude", []):
-            lines.append(f"{excl} merge=text")
+        attrs = []
+        if "strategy" in rule:
+            attrs.append(strategy_attribute(rule["strategy"]))
+        if "category" in rule:
+            attrs.append(f"git-for-agents-category={rule['category']}")
+        for pattern in rule_patterns(rule):
+            lines.append(f"{pattern} {' '.join(attrs)}")
     lines.append(GITATTRIBUTES_MARKER_END)
     return "\n".join(lines) + "\n"
 
 
-def update_gitattributes(policy: dict) -> None:
-    path = REPO_ROOT / ".gitattributes"
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-
+def updated_gitattributes(existing: str, policy: dict) -> str:
     block = build_gitattributes_block(policy)
-    if GITATTRIBUTES_MARKER_START in existing:
+    starts = existing.count(GITATTRIBUTES_MARKER_START)
+    ends = existing.count(GITATTRIBUTES_MARKER_END)
+    if starts != ends or starts > 1:
+        raise PolicyError("Malformed or duplicate generated .gitattributes markers; repair before setup")
+    if starts:
         start = existing.index(GITATTRIBUTES_MARKER_START)
         end = existing.index(GITATTRIBUTES_MARKER_END) + len(GITATTRIBUTES_MARKER_END)
-        existing = existing[:start] + block.rstrip("\n") + existing[end:]
-    else:
-        sep = "\n" if existing and not existing.endswith("\n") else ""
-        existing = existing + sep + ("\n" if existing else "") + block
-
-    path.write_text(existing, encoding="utf-8")
-    print(f"Updated {path}")
+        if end < start:
+            raise PolicyError("Reversed .gitattributes markers")
+        return existing[:start] + block.rstrip("\n") + existing[end:]
+    # Existing project attributes (e.g. Git LFS drivers) remain later and win.
+    return block + existing
 
 
-def configure_git_drivers(policy: dict) -> None:
-    strategies = {rule["strategy"] for rule in policy["rules"]}
+def configure_git_drivers(repo: pathlib.Path, policy_path: pathlib.Path, policy: dict):
+    strategies = {policy["default_strategy"]} | {r["strategy"] for r in policy["rules"] if "strategy" in r}
     for strategy in sorted(strategies & CUSTOM_STRATEGIES):
-        driver_cmd = f'python "{REPO_ROOT / "scripts" / "merge_driver.py"}" --strategy {strategy} %O %A %B %P'
-        run_git_config(f"merge.{strategy}.name", f"merge-policy: {strategy}")
-        run_git_config(f"merge.{strategy}.driver", driver_cmd)
-        run_git_config(f"merge.{strategy}.recursive", "binary")
-
-    unknown = strategies - BUILTIN_STRATEGIES - CUSTOM_STRATEGIES
-    if unknown:
-        print(f"warning: unknown strategy names in merge-policy.yaml: {sorted(unknown)}", file=sys.stderr)
+        # Git executes driver commands in its POSIX shell, including on Windows.
+        argv = [pathlib.Path(sys.executable).as_posix(), (TOOL_ROOT / "scripts/merge_driver.py").as_posix(),
+                "--policy", policy_path.as_posix(), "--strategy", strategy]
+        command = shlex.join(argv) + ' -- "%O" "%A" "%B" %P'
+        for key, value in {"name": f"merge-policy: {strategy}", "driver": command, "recursive": "binary"}.items():
+            git(repo, "config", "--local", f"merge.{strategy}.{key}", value)
 
 
-def run_git_config(key: str, value: str) -> None:
-    subprocess.run(["git", "config", key, value], cwd=REPO_ROOT, check=True)
-
-
-def main() -> int:
-    policy = load_policy()
-    update_gitattributes(policy)
-    configure_git_drivers(policy)
-    print("Merge policy applied. Review the diff to .gitattributes and commit it.")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_repository_arguments(parser)
+    parser.add_argument("--check", action="store_true", help="Validate and print generated attributes without changing files/config")
+    args = parser.parse_args()
+    repo, policy_path, policy = repository_context(args)
+    path = repo / ".gitattributes"
+    if path.is_symlink():
+        raise PolicyError("Refusing to write a symlinked .gitattributes")
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    updated = updated_gitattributes(existing, policy)
+    if args.check:
+        print(updated, end="")
+        return 0
+    configure_git_drivers(repo, policy_path, policy)
+    path.write_text(updated, encoding="utf-8", newline="\n")
+    print(f"Updated {path} and local merge drivers. Review and commit the attributes.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

@@ -1,91 +1,74 @@
-"""Generate a human-readable merge commit message summarizing per-file,
-per-branch changes, driven by the `commit_message` section of
-merge-policy.yaml.
+"""Summarize candidate branch changes by review category (not validation evidence).
 
-Typical usage, combining several feature branches into the current branch.
-Run this BEFORE the merge is committed, with --into set to the commit HEAD
-was at before merging (not a branch that the merges have already landed on):
-
-    git merge --no-commit --no-ff feature/a feature/b feature/c
-    python scripts/generate_merge_message.py feature/a feature/b feature/c --into HEAD > /tmp/msg.txt
-    git commit -F /tmp/msg.txt
-
-Produces something like:
-
-    Merge branches: feature/a, feature/b, feature/c
-
-    Combined changes by file:
-    - src/app.py: feature/a (+12/-3), feature/b (+5/-1)
-    - README.md: feature/c (+8/-0)
+Generate before a sequential merge commit, with --into pointing at its original
+target. For a multi-branch summary, retain the original target commit explicitly.
 """
 from __future__ import annotations
 
 import argparse
-import fnmatch
-import subprocess
-import sys
+import json
+import pathlib
 from collections import defaultdict
 
-from merge_policy import REPO_ROOT, load_policy
+from merge_policy import (add_repository_arguments, git, merge_base, repository_context, repository_ignore_case,
+                          resolve_path, resolve_ref, run_cli)
 
 
-def git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
-
-
-def strategy_for(policy: dict, path: str) -> str:
-    for rule in policy["rules"]:
-        if fnmatch.fnmatch(path, rule["pattern"]):
-            return rule["strategy"]
-    return policy["default_strategy"]
-
-
-def collect_stats(branches: list[str], into_ref: str) -> dict[str, list[tuple[str, int, int]]]:
-    per_file: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
-    for branch in branches:
-        merge_base = git("merge-base", into_ref, branch).strip()
-        numstat = git("diff", "--numstat", f"{merge_base}..{branch}")
-        for line in numstat.splitlines():
-            if not line.strip():
-                continue
-            added, removed, path = line.split("\t", 2)
-            added_n = 0 if added == "-" else int(added)
-            removed_n = 0 if removed == "-" else int(removed)
-            per_file[path].append((branch, added_n, removed_n))
+def collect_stats(repo, branches, into_ref):
+    per_file = defaultdict(list)
+    into_id = resolve_ref(repo, into_ref)
+    for branch in dict.fromkeys(branches):
+        branch_id = resolve_ref(repo, branch)
+        base = merge_base(repo, into_id, branch_id)
+        numstat = git(repo, "diff", "--no-ext-diff", "--no-renames", "--numstat", "-z", base, branch_id, "--")
+        for record in filter(None, numstat.split("\0")):
+            added, removed, path = record.split("\t", 2)
+            per_file[path].append((branch, None if added == "-" else int(added), None if removed == "-" else int(removed)))
     return per_file
 
 
-def build_message(policy: dict, branches: list[str], per_file: dict) -> str:
+def build_message(policy, branches, per_file, *, ignore_case=False):
     cfg = policy.get("commit_message", {})
-    title = cfg.get("title_template", "Merge branches: {branches}").format(branches=", ".join(branches))
-    lines = [title, ""]
-    lines.append("Combined changes by file:")
+    title = cfg.get("title_template", "Merge branches: {branches}").format(branches=", ".join(dict.fromkeys(branches)))
+    lines = [title, "", "Candidate changes since divergence (review the resolved merge separately):"]
+    groups = defaultdict(list)
     for path in sorted(per_file):
-        entries = per_file[path]
-        parts = []
-        for branch, added, removed in entries:
-            if cfg.get("include_stat_counts", True):
-                parts.append(f"{branch} (+{added}/-{removed})")
-            else:
-                parts.append(branch)
-        suffix = ""
-        if cfg.get("include_strategy_used", True):
-            suffix = f"  [strategy={strategy_for(policy, path)}]"
-        lines.append(f"- {path}: {', '.join(parts)}{suffix}")
+        category = resolve_path(policy, path, ignore_case=ignore_case)["category"] if cfg.get("group_by", "category") == "category" else "file"
+        groups[category].append(path)
+    if not groups:
+        lines.append("No candidate file changes.")
+    order = list(policy["categories"]) if cfg.get("group_by", "category") == "category" else ["file"]
+    for category in order:
+        if category not in groups:
+            continue
+        lines += ["", f"{category}:"]
+        for path in groups[category]:
+            parts = []
+            for branch, added, removed in per_file[path]:
+                stats = " (binary)" if added is None else f" (+{added}/-{removed})"
+                parts.append(branch + (stats if cfg.get("include_stat_counts", True) else ""))
+            resolved = resolve_path(policy, path, ignore_case=ignore_case)
+            suffix = f" [policy strategy={resolved['strategy']}; category={resolved['category']}]" if cfg.get("include_strategy_used", True) else ""
+            lines.append(f"- {json.dumps(path, ensure_ascii=False)}: {', '.join(parts)}{suffix}")
     return "\n".join(lines) + "\n"
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("branches", nargs="+", help="Branches being merged in")
-    parser.add_argument("--into", default="HEAD", help="Target ref the branches are merged into (default HEAD)")
+    add_repository_arguments(parser)
+    parser.add_argument("branches", nargs="+", help="Branches being merged")
+    parser.add_argument("--into", default="HEAD", help="Original target commit/ref (default HEAD)")
+    parser.add_argument("--output", type=pathlib.Path, help="Write UTF-8 directly, avoiding shell redirection encoding differences")
     args = parser.parse_args()
-
-    policy = load_policy()
-    per_file = collect_stats(args.branches, args.into)
-    sys.stdout.write(build_message(policy, args.branches, per_file))
+    repo, _, policy = repository_context(args)
+    message = build_message(policy, args.branches, collect_stats(repo, args.branches, args.into),
+                            ignore_case=repository_ignore_case(repo))
+    if args.output:
+        args.output.write_text(message, encoding="utf-8", newline="\n")
+    else:
+        print(message, end="")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

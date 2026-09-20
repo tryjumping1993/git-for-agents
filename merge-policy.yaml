@@ -1,105 +1,74 @@
-# merge-policy.yaml
-#
-# Central, human-readable config that drives how this repo combines
-# concurrent changes to the *same files* across multiple branches.
-#
-# It is consumed by:
-#   scripts/setup_merge_drivers.py   -> turns this file into .gitattributes
-#                                        entries + `git config` merge drivers
-#   scripts/merge_driver.py          -> the actual driver git invokes per file
-#   scripts/generate_merge_message.py -> builds a human-readable merge commit
-#                                        message summarizing changes per file
-#                                        per source branch
-#
-# Run `python scripts/setup_merge_drivers.py` once after cloning (and again
-# any time this file changes) to apply the policy locally.
-
-version: 1
-
-# Default strategy used for any file that doesn't match a rule below.
-# Options: standard | union | ours | theirs
-# - standard: normal 3-way text merge (git's built-in), conflicts marked as usual
-# - union:    keep lines added by *both* sides, drop only lines both sides removed
-# - ours/theirs: always resolve to one side automatically (use sparingly!)
+# A language- and platform-independent starting point. Tailor paths and checks
+# to each repository. Category controls review expectations; strategy controls
+# file merging. Later matching rules win independently for each field.
+version: 2
 default_strategy: standard
+default_category: other
+
+categories:
+  source:
+    description: "Source code: thorough behavioral and regression review"
+    checks:
+      - "Trace changes to the requested behavior and existing contracts; inspect callers and consumers."
+      - "Review correctness, edge cases, error handling, security, and compatibility; assess performance where relevant."
+      - "Run relevant existing tests, builds, and static checks; add regression coverage for changed behavior or fixed defects."
+      - "Inspect interactions across all merged branches, including tests, schemas, dependencies, and runtime configuration."
+  devops:
+    description: "DevOps: validate improvements against the original operational intent"
+    checks:
+      - "Read the existing configuration and documentation; identify the behavior and constraints it was meant to preserve."
+      - "Validate the proposed change with the repository's linters, configuration checks, or non-mutating plan/dry-run tooling."
+      - "Compare triggers, environments, permissions, secrets handling, artifacts, deployment order, and rollback behavior with the existing intent."
+  docs:
+    description: "Documentation and process guidance"
+    checks:
+      - "Check accuracy, links, and examples against the resulting implementation and workflow."
+  data:
+    description: "Data and assets"
+    checks:
+      - "Validate formats, schemas, consumers, and any required reproducibility or provenance."
+  other:
+    description: "Unclassified: establish purpose before accepting changes"
+    checks:
+      - "Identify the file's purpose and update classification if appropriate; use source-level scrutiny for executable or behavioral changes."
 
 rules:
-  # --- Structured/append-only docs: safe to union so entries from
-  #     different branches are combined instead of conflicting. ---
-  - pattern: "CHANGELOG.md"
-    strategy: union
-    reason: "Changelog entries from different branches should all be kept."
+  # Broad examples, not an exhaustive language allowlist. Unknown files retain
+  # normal Git handling and explicit review rather than being ignored.
+  - patterns: ["src/**", "lib/**", "app/**", "apps/**", "packages/**", "tests/**", "test/**"]
+    category: source
+  - patterns: ["*.py", "*.js", "*.jsx", "*.ts", "*.tsx", "*.mjs", "*.cjs", "*.java", "*.kt", "*.scala", "*.go", "*.rs", "*.c", "*.h", "*.cpp", "*.hpp", "*.cs", "*.fs", "*.rb", "*.php", "*.swift", "*.m", "*.mm", "*.dart", "*.ex", "*.exs", "*.erl", "*.hs", "*.lua", "*.r", "*.R", "*.jl", "*.sh", "*.ps1", "*.sql", "*.vue", "*.svelte", "*.html", "*.css", "*.scss", "*.proto", "*.graphql", "*.ipynb"]
+    category: source
+  - patterns: ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "go.sum", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock", "pom.xml", "build.gradle*", "*.csproj", "*.fsproj", "requirements*.txt"]
+    category: source
+  - patterns: ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "poetry.lock", "uv.lock", "Pipfile.lock", "Cargo.lock", "packages.lock.json"]
+    category: source
+  - patterns: ["*.md", "*.rst", "*.adoc", "docs/**", "LICENSE*", "NOTICE*"]
+    category: docs
+  - patterns: ["data/**", "assets/**", "*.csv", "*.tsv", "*.parquet"]
+    category: data
 
-  - pattern: "*.log"
-    strategy: union
-    reason: "Log-style files just accumulate lines."
-
-  # --- Machine-generated lockfiles: never hand-merge, regenerate instead. ---
-  - pattern: "package-lock.json"
-    strategy: regenerate
-    command: "npm install --package-lock-only"
-    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
-
-  - pattern: "poetry.lock"
-    strategy: regenerate
-    command: "poetry lock --no-update"
-    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
-
-  - pattern: "yarn.lock"
-    strategy: regenerate
-    command: "yarn install --mode=update-lockfile"
-    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
-
-  # --- Structured config/data: merge by key instead of by line, so two
-  #     branches adding different keys to the same object don't conflict. ---
-  - pattern: "*.json"
-    exclude: ["package-lock.json"]
-    strategy: json-deep-merge
-    reason: "Combine added/changed keys from each branch; only real key-level
-      collisions are left as conflicts."
-
-  - pattern: "*.yml"
-    strategy: yaml-deep-merge
-    exclude: ["merge-policy.yaml"]
-    reason: "Combine added/changed keys from each branch; only real key-level
-      collisions are left as conflicts."
-  - pattern: "*.yaml"
-    strategy: yaml-deep-merge
-    exclude: ["merge-policy.yaml"]
-    reason: "Combine added/changed keys from each branch; only real key-level
-      collisions are left as conflicts."
-
-  # --- Source code: use git's normal, well-tested 3-way merge. Combining
-  #     code line-by-line automatically is not safe; real conflicts should
-  #     surface for a human/agent to resolve. ---
-  - pattern: "*.py"
-    strategy: standard
-  - pattern: "*.js"
-    strategy: standard
-  - pattern: "*.ts"
+  # Paths establish purpose: YAML/JSON can be application data or executable
+  # operational configuration. No global structured merge for either format.
+  - patterns: ["**/.github/workflows/**", "**/.github/actions/**", "**/.circleci/**", "**/.gitlab/**", ".gitlab-ci.yml", "azure-pipelines*.yml", "Jenkinsfile*", "**/ci/**", "**/infra/**", "**/infrastructure/**", "**/deploy/**", "**/deployment/**", "**/terraform/**", "**/ansible/**", "**/k8s/**", "**/kubernetes/**", "**/helm/**", "**/charts/**", "Dockerfile*", "Containerfile*", "docker-compose*.yml", "docker-compose*.yaml", "compose*.yml", "compose*.yaml", "*.tf", "*.tfvars", "*.tf.json", "*.tfvars.json", "Pulumi*.yaml", ".terraform.lock.hcl", "Makefile", "*.mk", ".gitattributes", ".gitignore", "merge-policy.yaml"]
+    category: devops
     strategy: standard
 
-  # --- Binary/generated assets: last-writer-wins would silently lose work,
-  #     so treat as a hard conflict that must be resolved manually. ---
-  - pattern: "*.png"
-    strategy: manual-conflict
-  - pattern: "*.jpg"
-    strategy: manual-conflict
-  - pattern: "*.pdf"
+  # Commands vary with package-manager versions. Add a command to a specific
+  # rule only when it is documented for the owning package. Never auto-executed.
+  - patterns: ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "poetry.lock", "uv.lock", "Pipfile.lock", "Cargo.lock", "packages.lock.json"]
+    strategy: regenerate
+    reason: "Reconcile inputs and regenerate with the repository's pinned tools."
+  - patterns: ["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.ico", "*.pdf", "*.zip", "*.gz", "*.woff", "*.woff2", "*.sqlite", "*.db", "*.parquet"]
     strategy: manual-conflict
 
-# Options controlling the human-readable merge commit message that
-# scripts/generate_merge_message.py produces when combining several
-# branches (e.g. an octopus merge, or a sequence of merges into an
-# integration branch).
+  # Opt in only for data whose consumers tolerate reserialization:
+  # - pattern: "data/catalog/*.json"
+  #   category: data
+  #   strategy: json-deep-merge
+
 commit_message:
   title_template: "Merge branches: {branches}"
-  # Group the body by file, listing which branch touched it and the
-  # +added/-removed line counts, e.g.:
-  #
-  #   Combined changes by file:
-  #   - src/app.py: feature/a (+12/-3), feature/b (+5/-1)
-  #   - README.md: feature/c (+8/-0)
-  group_by: file
+  group_by: category
   include_stat_counts: true
   include_strategy_used: true
