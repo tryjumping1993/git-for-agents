@@ -1,0 +1,16 @@
+# >>> merge-policy.yaml (auto-generated, do not edit by hand) >>>
+CHANGELOG.md merge=union
+*.log merge=union
+package-lock.json merge=regenerate
+poetry.lock merge=regenerate
+yarn.lock merge=regenerate
+*.json merge=json-deep-merge
+package-lock.json merge=text
+*.yml merge=yaml-deep-merge
+merge-policy.yaml merge=text
+*.yaml merge=yaml-deep-merge
+merge-policy.yaml merge=text
+*.png merge=manual-conflict
+*.jpg merge=manual-conflict
+*.pdf merge=manual-conflict
+# <<< merge-policy.yaml <<<

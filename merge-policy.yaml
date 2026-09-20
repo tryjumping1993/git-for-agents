@@ -1,0 +1,105 @@
+# merge-policy.yaml
+#
+# Central, human-readable config that drives how this repo combines
+# concurrent changes to the *same files* across multiple branches.
+#
+# It is consumed by:
+#   scripts/setup_merge_drivers.py   -> turns this file into .gitattributes
+#                                        entries + `git config` merge drivers
+#   scripts/merge_driver.py          -> the actual driver git invokes per file
+#   scripts/generate_merge_message.py -> builds a human-readable merge commit
+#                                        message summarizing changes per file
+#                                        per source branch
+#
+# Run `python scripts/setup_merge_drivers.py` once after cloning (and again
+# any time this file changes) to apply the policy locally.
+
+version: 1
+
+# Default strategy used for any file that doesn't match a rule below.
+# Options: standard | union | ours | theirs
+# - standard: normal 3-way text merge (git's built-in), conflicts marked as usual
+# - union:    keep lines added by *both* sides, drop only lines both sides removed
+# - ours/theirs: always resolve to one side automatically (use sparingly!)
+default_strategy: standard
+
+rules:
+  # --- Structured/append-only docs: safe to union so entries from
+  #     different branches are combined instead of conflicting. ---
+  - pattern: "CHANGELOG.md"
+    strategy: union
+    reason: "Changelog entries from different branches should all be kept."
+
+  - pattern: "*.log"
+    strategy: union
+    reason: "Log-style files just accumulate lines."
+
+  # --- Machine-generated lockfiles: never hand-merge, regenerate instead. ---
+  - pattern: "package-lock.json"
+    strategy: regenerate
+    command: "npm install --package-lock-only"
+    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
+
+  - pattern: "poetry.lock"
+    strategy: regenerate
+    command: "poetry lock --no-update"
+    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
+
+  - pattern: "yarn.lock"
+    strategy: regenerate
+    command: "yarn install --mode=update-lockfile"
+    reason: "Lockfiles are derived data; regenerate rather than diff/merge."
+
+  # --- Structured config/data: merge by key instead of by line, so two
+  #     branches adding different keys to the same object don't conflict. ---
+  - pattern: "*.json"
+    exclude: ["package-lock.json"]
+    strategy: json-deep-merge
+    reason: "Combine added/changed keys from each branch; only real key-level
+      collisions are left as conflicts."
+
+  - pattern: "*.yml"
+    strategy: yaml-deep-merge
+    exclude: ["merge-policy.yaml"]
+    reason: "Combine added/changed keys from each branch; only real key-level
+      collisions are left as conflicts."
+  - pattern: "*.yaml"
+    strategy: yaml-deep-merge
+    exclude: ["merge-policy.yaml"]
+    reason: "Combine added/changed keys from each branch; only real key-level
+      collisions are left as conflicts."
+
+  # --- Source code: use git's normal, well-tested 3-way merge. Combining
+  #     code line-by-line automatically is not safe; real conflicts should
+  #     surface for a human/agent to resolve. ---
+  - pattern: "*.py"
+    strategy: standard
+  - pattern: "*.js"
+    strategy: standard
+  - pattern: "*.ts"
+    strategy: standard
+
+  # --- Binary/generated assets: last-writer-wins would silently lose work,
+  #     so treat as a hard conflict that must be resolved manually. ---
+  - pattern: "*.png"
+    strategy: manual-conflict
+  - pattern: "*.jpg"
+    strategy: manual-conflict
+  - pattern: "*.pdf"
+    strategy: manual-conflict
+
+# Options controlling the human-readable merge commit message that
+# scripts/generate_merge_message.py produces when combining several
+# branches (e.g. an octopus merge, or a sequence of merges into an
+# integration branch).
+commit_message:
+  title_template: "Merge branches: {branches}"
+  # Group the body by file, listing which branch touched it and the
+  # +added/-removed line counts, e.g.:
+  #
+  #   Combined changes by file:
+  #   - src/app.py: feature/a (+12/-3), feature/b (+5/-1)
+  #   - README.md: feature/c (+8/-0)
+  group_by: file
+  include_stat_counts: true
+  include_strategy_used: true
